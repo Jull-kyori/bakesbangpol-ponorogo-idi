@@ -1,0 +1,16 @@
+{
+  "name": "bakesbangpol-ponorogo-idi",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aplikasi mandiri Indeks Demokrasi Indonesia Kabupaten Ponorogo",
+  "scripts": {
+    "start": "node server.js",
+    "db:migrate": "node scripts/migrate.js",
+    "db:import": "node scripts/import-json.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "multer": "^2.0.0",
+    "pg": "^8.13.0"
+  }
+}

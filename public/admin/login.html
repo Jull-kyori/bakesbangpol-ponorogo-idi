@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex" />
+  <title>Masuk Admin | Indeks Demokrasi Indonesia</title>
+  <link rel="stylesheet" href="/css/output.css" />
+</head>
+<body class="flex min-h-screen items-center justify-center bg-cream px-6 text-slate-800 antialiased">
+  <main class="w-full max-w-sm rounded-xl bg-white p-8 ring-1 ring-ink/10" data-motion="enter">
+    <h1 class="text-2xl font-bold text-ink">Masuk admin E-IDI</h1>
+    <p class="mt-1 text-sm text-slate-600">Khusus pengelola data Indeks Demokrasi Indonesia.</p>
+    <form id="form" class="mt-6 space-y-4">
+      <div>
+        <label for="password" class="text-sm font-semibold text-ink">Password</label>
+        <input id="password" type="password" required autocomplete="current-password" class="mt-1 w-full rounded-lg border border-ink/20 px-4 py-2" />
+      </div>
+      <p id="error" class="hidden text-sm font-semibold text-red-700" role="alert"></p>
+      <button class="w-full rounded-lg bg-primary px-4 py-2.5 font-semibold text-ink hover:bg-accent hover:text-white">Masuk</button>
+    </form>
+  </main>
+  <script>
+    document.getElementById('form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const error = document.getElementById('error');
+      error.classList.add('hidden');
+      try {
+        const response = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: document.getElementById('password').value })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Gagal masuk.');
+        const next = new URLSearchParams(location.search).get('next');
+        location.href = next === '/admin/' ? next : '/admin/';
+      } catch (cause) {
+        error.textContent = cause.message;
+        error.classList.remove('hidden');
+      }
+    });
+  </script>
+</body>
+</html>
