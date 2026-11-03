@@ -1,5 +1,6 @@
 node_modules/
 .env
 data/idi-audit.log
+data/idi-state.json
 public/uploads/idi/*
 !public/uploads/idi/.gitkeep

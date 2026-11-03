@@ -4,7 +4,6 @@ const multer = require('multer');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { Pool } = require('pg');
 
 const envPath = path.join(__dirname, '.env');
 if (fs.existsSync(envPath)) {
@@ -15,18 +14,21 @@ if (fs.existsSync(envPath)) {
 }
 
 const PORT = Number(process.env.PORT || 3100);
-const DATABASE_URL = process.env.DATABASE_URL;
 const ADMIN_PASSWORD = process.env.IDI_ADMIN_PASSWORD || '';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const SESSION_MS = 8 * 60 * 60 * 1000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const DATA_DIR = path.join(__dirname, 'data');
+const SOURCE_DATA_FILE = path.join(DATA_DIR, 'idi.json');
+const STATE_FILE = path.join(DATA_DIR, 'idi-state.json');
+const LEGACY_AUDIT_FILE = path.join(DATA_DIR, 'idi-audit.log');
 const UPLOAD_DIR = path.join(PUBLIC_DIR, 'uploads', 'idi');
 const ASPECTS = new Set(['Kebebasan Sipil', 'Kesetaraan Politik', 'Lembaga Demokrasi']);
 const sessions = new Map();
 const loginAttempts = new Map();
 const loginWindows = new Map();
+let writeQueue = Promise.resolve();
 
-if (!DATABASE_URL) throw new Error('DATABASE_URL wajib diatur sebelum menjalankan aplikasi E-IDI.');
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT harus berupa angka antara 1 dan 65535.');
 if (IS_PRODUCTION) {
   if (ADMIN_PASSWORD.length < 16 || ADMIN_PASSWORD.startsWith('ganti_dengan_')) {
@@ -38,9 +40,79 @@ if (IS_PRODUCTION) {
 }
 if (!ADMIN_PASSWORD) console.warn('[Peringatan] IDI_ADMIN_PASSWORD belum diatur; login admin dinonaktifkan.');
 
-const pool = new Pool({ connectionString: DATABASE_URL });
-pool.on('error', (error) => console.error(`[PostgreSQL] ${error.message}`));
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+function validateDataset(data) {
+  if (
+    !data || !Number.isInteger(data.tahun) || !Number.isInteger(data.periodeData) ||
+    !Array.isArray(data.aspek) || !Array.isArray(data.tren) || !Array.isArray(data.indikator) ||
+    data.aspek.length === 0 || data.indikator.length === 0
+  ) {
+    throw new Error('File data E-IDI harus memiliki tahun, periode, aspek, tren, dan indikator yang valid.');
+  }
+  const aspectCodes = new Set(data.aspek.map((aspect) => aspect.kode));
+  if (data.indikator.some((item) => !item.id || !aspectCodes.has(item.aspek))) {
+    throw new Error('Setiap indikator harus memiliki ID dan mengacu ke aspek yang tersedia.');
+  }
+  return data;
+}
+
+function readLegacyAudit() {
+  if (!fs.existsSync(LEGACY_AUDIT_FILE)) return [];
+  return fs.readFileSync(LEGACY_AUDIT_FILE, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => {
+    const [occurredAt, actorIp, action, ...detail] = line.split('\t');
+    if (!occurredAt || !['TAMBAH', 'UBAH', 'HAPUS'].includes(action) || !detail.length) {
+      throw new Error('Format log audit E-IDI lama tidak valid.');
+    }
+    if (Number.isNaN(Date.parse(occurredAt))) throw new Error('Waktu pada log audit E-IDI lama tidak valid.');
+    return { occurredAt, actorIp: actorIp || '', action, detail: detail.join(' ') };
+  });
+}
+
+function readAppState() {
+  if (fs.existsSync(STATE_FILE)) {
+    const state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    validateDataset(state.dataset);
+    if (!Array.isArray(state.audit)) throw new Error('Riwayat audit E-IDI tidak valid.');
+    return state;
+  }
+  return { dataset: validateDataset(JSON.parse(fs.readFileSync(SOURCE_DATA_FILE, 'utf8'))), audit: readLegacyAudit() };
+}
+
+let appState = readAppState();
+
+async function persistAppState(state) {
+  const temporaryFile = `${STATE_FILE}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await fs.promises.writeFile(temporaryFile, `${JSON.stringify(state, null, 2)}\n`, { flag: 'wx' });
+    await fs.promises.rename(temporaryFile, STATE_FILE);
+  } catch (error) {
+    try {
+      await fs.promises.unlink(temporaryFile);
+    } catch (cleanupError) {
+      if (cleanupError.code !== 'ENOENT') console.error(`[Penyimpanan E-IDI] ${cleanupError.message}`);
+    }
+    throw error;
+  }
+}
+
+function mutateDataset(req, action, detail, update) {
+  const operation = writeQueue.then(async () => {
+    const nextState = structuredClone(appState);
+    const result = update(nextState.dataset);
+    nextState.audit.push({
+      occurredAt: new Date().toISOString(),
+      actorIp: req.ip,
+      action,
+      detail: String(detail).replace(/[\t\r\n]+/g, ' ')
+    });
+    await persistAppState(nextState);
+    appState = nextState;
+    return result;
+  });
+  writeQueue = operation.catch(() => {});
+  return operation;
+}
 
 function getCookie(req, name) {
   for (const part of (req.headers.cookie || '').split(';')) {
@@ -170,62 +242,6 @@ function uploadDocument(req, res, next) {
   });
 }
 
-async function getCurrentDataset(client) {
-  const result = await client.query(
-    'SELECT * FROM idi_datasets WHERE is_current = TRUE LIMIT 1'
-  );
-  if (!result.rowCount) {
-    const error = new Error('Data E-IDI belum diimpor ke PostgreSQL.');
-    error.status = 503;
-    throw error;
-  }
-  return result.rows[0];
-}
-
-async function readPublishedData() {
-  const client = await pool.connect();
-  try {
-    const dataset = await getCurrentDataset(client);
-    const [aspects, trends, indicators] = await Promise.all([
-      client.query(
-        `SELECT code AS kode, roman AS romawi, title AS judul, short_title AS singkat,
-                description AS deskripsi, score AS skor, icon AS ikon
-         FROM idi_aspects WHERE dataset_id = $1 ORDER BY display_order`,
-        [dataset.id]
-      ),
-      client.query(
-        'SELECT year AS tahun, value AS nilai FROM idi_trends WHERE dataset_id = $1 ORDER BY year',
-        [dataset.id]
-      ),
-      client.query(
-        `SELECT id, aspect_code AS aspek, indicator AS indikator, notes AS catatan,
-                score AS skor, document_path AS dokumen, document_name AS "dokumenNama",
-                updated_at AS "updatedAt"
-         FROM idi_indicators WHERE dataset_id = $1 ORDER BY display_order`,
-        [dataset.id]
-      )
-    ]);
-    return {
-      tahun: dataset.assessment_year,
-      periodeData: dataset.data_year,
-      skorTotal: dataset.total_score === null ? null : Number(dataset.total_score),
-      sumberTren: dataset.trend_source,
-      aspek: aspects.rows.map((row) => ({ ...row, skor: Number(row.skor) })),
-      tren: trends.rows.map((row) => ({ ...row, nilai: Number(row.nilai) })),
-      indikator: indicators.rows.map((row) => ({ ...row, skor: Number(row.skor) }))
-    };
-  } finally {
-    client.release();
-  }
-}
-
-async function writeAudit(client, req, action, detail) {
-  await client.query(
-    'INSERT INTO idi_audit (actor_ip, action, detail) VALUES ($1, $2, $3)',
-    [req.ip, action, String(detail).replace(/[\t\r\n]+/g, ' ')]
-  );
-}
-
 const app = express();
 app.disable('x-powered-by');
 if (process.env.TRUST_PROXY_HOPS) {
@@ -278,7 +294,7 @@ app.post('/api/logout', (req, res) => {
 });
 
 app.get('/api/admin/me', requireAdmin, (_req, res) => res.json({ ok: true }));
-app.get('/api/idi', asyncRoute(async (_req, res) => res.json(await readPublishedData())));
+app.get('/api/idi', (_req, res) => res.json(appState.dataset));
 app.get('/api/session', (req, res) => res.json({ admin: isAdmin(req) }));
 
 app.post('/api/idi/indikator', requireAdmin, uploadDocument, asyncRoute(async (req, res) => {
@@ -287,33 +303,33 @@ app.post('/api/idi/indikator', requireAdmin, uploadDocument, asyncRoute(async (r
     if (req.file) removeDocument('/uploads/idi/' + req.file.filename);
     return res.status(400).json({ error: value.errors.join(' ') });
   }
-  const client = await pool.connect();
   const documentPath = req.file ? '/uploads/idi/' + req.file.filename : '';
   const documentName = req.file ? cleanName(req.file.originalname) : '';
   const id = crypto.randomBytes(6).toString('hex');
   try {
-    await client.query('BEGIN');
-    const dataset = await getCurrentDataset(client);
-    await client.query('SELECT id FROM idi_datasets WHERE id = $1 FOR UPDATE', [dataset.id]);
-    const result = await client.query(
-      `INSERT INTO idi_indicators
-        (id, dataset_id, aspect_code, display_order, indicator, notes, score, document_path, document_name)
-       SELECT $1, $2, $3, COALESCE(MAX(display_order), 0) + 1, $4, $5, $6, $7, $8
-       FROM idi_indicators WHERE dataset_id = $2
-       RETURNING id, aspect_code AS aspek, indicator AS indikator, notes AS catatan,
-                 score AS skor, document_path AS dokumen, document_name AS "dokumenNama",
-                 updated_at AS "updatedAt"`,
-      [id, dataset.id, value.aspect, value.indicator, value.notes, value.score, documentPath, documentName]
+    const indicator = await mutateDataset(
+      req,
+      'TAMBAH',
+      `${value.indicator} (skor ${value.score})`,
+      (dataset) => {
+        const item = {
+          id,
+          aspek: value.aspect,
+          indikator: value.indicator,
+          catatan: value.notes,
+          skor: value.score,
+          dokumen: documentPath,
+          dokumenNama: documentName,
+          updatedAt: new Date().toISOString()
+        };
+        dataset.indikator.push(item);
+        return item;
+      }
     );
-    await writeAudit(client, req, 'TAMBAH', `${value.indicator} (skor ${value.score})`);
-    await client.query('COMMIT');
-    res.status(201).json({ ...result.rows[0], skor: Number(result.rows[0].skor) });
+    res.status(201).json(indicator);
   } catch (error) {
-    await client.query('ROLLBACK');
     if (req.file) removeDocument(documentPath);
     throw error;
-  } finally {
-    client.release();
   }
 }));
 
@@ -323,79 +339,59 @@ app.put('/api/idi/indikator/:id', requireAdmin, uploadDocument, asyncRoute(async
     if (req.file) removeDocument('/uploads/idi/' + req.file.filename);
     return res.status(400).json({ error: value.errors.join(' ') });
   }
-  const client = await pool.connect();
   const newPath = req.file ? '/uploads/idi/' + req.file.filename : '';
-  let oldPath = '';
   try {
-    await client.query('BEGIN');
-    const dataset = await getCurrentDataset(client);
-    const existing = await client.query(
-      'SELECT score, document_path, document_name FROM idi_indicators WHERE dataset_id = $1 AND id = $2 FOR UPDATE',
-      [dataset.id, req.params.id]
+    const result = await mutateDataset(
+      req,
+      'UBAH',
+      `${value.indicator} (skor diperbarui menjadi ${value.score})`,
+      (dataset) => {
+        const index = dataset.indikator.findIndex((item) => item.id === req.params.id);
+        if (index < 0) {
+          const error = new Error('Indikator tidak ditemukan.');
+          error.status = 404;
+          throw error;
+        }
+        const current = dataset.indikator[index];
+        const removeOld = req.body.hapus_dokumen === 'on' && !req.file;
+        const documentPath = req.file ? newPath : removeOld ? '' : current.dokumen || '';
+        const documentName = req.file
+          ? cleanName(req.file.originalname)
+          : removeOld ? '' : current.dokumenNama || '';
+        const item = {
+          ...current,
+          aspek: value.aspect,
+          indikator: value.indicator,
+          catatan: value.notes,
+          skor: value.score,
+          dokumen: documentPath,
+          dokumenNama: documentName,
+          updatedAt: new Date().toISOString()
+        };
+        dataset.indikator[index] = item;
+        return { item, oldPath: current.dokumen || '' };
+      }
     );
-    if (!existing.rowCount) {
-      await client.query('ROLLBACK');
-      if (req.file) removeDocument(newPath);
-      return res.status(404).json({ error: 'Indikator tidak ditemukan.' });
-    }
-    const current = existing.rows[0];
-    oldPath = current.document_path;
-    const removeOld = req.body.hapus_dokumen === 'on' && !req.file;
-    const documentPath = req.file ? newPath : removeOld ? '' : current.document_path;
-    const documentName = req.file ? cleanName(req.file.originalname) : removeOld ? '' : current.document_name;
-    const result = await client.query(
-      `UPDATE idi_indicators
-       SET aspect_code = $1, indicator = $2, notes = $3, score = $4,
-           document_path = $5, document_name = $6, updated_at = NOW()
-       WHERE dataset_id = $7 AND id = $8
-       RETURNING id, aspect_code AS aspek, indicator AS indikator, notes AS catatan,
-                 score AS skor, document_path AS dokumen, document_name AS "dokumenNama",
-                 updated_at AS "updatedAt"`,
-      [value.aspect, value.indicator, value.notes, value.score, documentPath, documentName, dataset.id, req.params.id]
-    );
-    await writeAudit(client, req, 'UBAH', `${value.indicator} (skor ${current.score || ''} -> ${value.score})`);
-    await client.query('COMMIT');
-    if (oldPath && oldPath !== documentPath) removeDocument(oldPath);
-    res.json({ ...result.rows[0], skor: Number(result.rows[0].skor) });
+    if (result.oldPath && result.oldPath !== result.item.dokumen) removeDocument(result.oldPath);
+    res.json(result.item);
   } catch (error) {
-    await client.query('ROLLBACK');
     if (req.file) removeDocument(newPath);
     throw error;
-  } finally {
-    client.release();
   }
 }));
 
 app.delete('/api/idi/indikator/:id', requireAdmin, asyncRoute(async (req, res) => {
-  const client = await pool.connect();
-  let documentPath = '';
-  try {
-    await client.query('BEGIN');
-    const dataset = await getCurrentDataset(client);
-    const existing = await client.query(
-      'SELECT indicator, score, document_path FROM idi_indicators WHERE dataset_id = $1 AND id = $2 FOR UPDATE',
-      [dataset.id, req.params.id]
-    );
-    if (!existing.rowCount) {
-      await client.query('ROLLBACK');
-      return res.status(404).json({ error: 'Indikator tidak ditemukan.' });
+  const removed = await mutateDataset(req, 'HAPUS', `Indikator ${req.params.id}`, (dataset) => {
+    const index = dataset.indikator.findIndex((item) => item.id === req.params.id);
+    if (index < 0) {
+      const error = new Error('Indikator tidak ditemukan.');
+      error.status = 404;
+      throw error;
     }
-    const item = existing.rows[0];
-    documentPath = item.document_path;
-    await client.query(
-      'DELETE FROM idi_indicators WHERE dataset_id = $1 AND id = $2',
-      [dataset.id, req.params.id]
-    );
-    await writeAudit(client, req, 'HAPUS', `${item.indicator} (skor ${item.score})`);
-    await client.query('COMMIT');
-    removeDocument(documentPath);
-    res.json({ ok: true });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
+    return dataset.indikator.splice(index, 1)[0];
+  });
+  if (removed.dokumen) removeDocument(removed.dokumen);
+  res.json({ ok: true });
 }));
 
 app.get(['/admin', '/admin/', '/admin/index.html'], (req, res) => {
